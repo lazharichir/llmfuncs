@@ -1,0 +1,50 @@
+{
+  "name": "@llmfuncs/funcs",
+  "version": "0.0.1",
+  "description": "An LLM-based data engineering library that provides a set of functions to manipulate and transform data using large language models.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "homepage": "https://github.com/lazharichir/llmfuncs",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lazharichir/llmfuncs.git"
+  },
+  "scripts": {
+    "format": "biome format --write",
+    "lint": "biome format --write",
+    "check": "biome check --write",
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "bump:patch": "npm version patch",
+    "bump:minor": "npm version minor",
+    "bump:major": "npm version major",
+    "prepublish": "rm -rf dist && vitest run && tsc"
+  },
+  "keywords": [
+    "llm",
+    "generative ai",
+    "genai",
+    "data engineering",
+    "data manipulation"
+  ],
+  "author": "Lazhar Ichir",
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "1.9.4",
+    "@types/node": "^22.14.0",
+    "dotenv": "^16.4.7",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.1"
+  },
+  "dependencies": {
+    "@google/genai": "^0.7.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "/dist"
+  ]
+}

@@ -4,7 +4,7 @@
 
 **Describe Data Operations in English, Execute with Confidence.**
 
-[![NPM Version](https://img.shields.io/npm/v/llmfuncs?style=flat-square)](https://www.npmjs.com/package/llmfuncs)
+[![NPM Version](https://img.shields.io/npm/v/@llmfuncs/llmfuncs?style=flat-square)](https://www.npmjs.com/package/@llmfuncs/funcs)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 
 Tired of writing boilerplate JavaScript/TypeScript for common array and object manipulations? Wish you could just *describe* what you want to do? LLMFuncs bridges the gap, allowing you to use natural language instructions, powered by Large Language Models (LLMs), to perform data operations like filtering, safely and efficiently.

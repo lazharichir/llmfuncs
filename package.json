@@ -20,7 +20,7 @@
     "bump:patch": "npm version patch",
     "bump:minor": "npm version minor",
     "bump:major": "npm version major",
-    "prepublish": "rm -rf dist && vitest run && tsc"
+    "prepublishOnly": "rm -rf dist && vitest run && tsc"
   },
   "keywords": [
     "llm",

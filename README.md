@@ -64,6 +64,15 @@ console.log('Cheap Items:', cheapItems);
 //   { name: 'Orange', category: 'Fruit', price: 0.8 }
 // ]
 
+// Find the first expensive item
+const expensiveItem = await find(
+  items,
+  "first item that costs more than $1000"
+);
+console.log('First Expensive Item:', expensiveItem);
+// Expected output:
+// { name: 'Laptop', category: 'Electronics', price: 1200 }
+
 ```
 
 ## License

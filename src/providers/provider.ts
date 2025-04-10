@@ -38,6 +38,7 @@ export interface ExecuteOptions {
 	maxTokens?: number;
 	tools?: Tool[];
 	structuredOutput?: JsonSchema;
+	signal?: AbortSignal;
 }
 
 export interface Provider {

@@ -1,6 +1,6 @@
 {
   "name": "@llmfuncs/funcs",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "An LLM-based data engineering library that provides a set of functions to manipulate and transform data using large language models.",
   "type": "module",
   "main": "dist/index.js",

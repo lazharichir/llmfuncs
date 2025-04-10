@@ -1,5 +1,5 @@
 import type { JsonSchema } from "@/providers/jsonschema";
-import type { Message, Provider } from "@/providers/provider";
+import type { Message, Provider, ExecuteOptions } from "@/providers/provider";
 import {
 	type EffectiveBatchingOptions,
 	chunk,
@@ -53,8 +53,9 @@ type StructuredOutput = {
 
 /**
  * Finds the first item in an array that matches a natural language predicate.
- * Respects the original order of items when determining the "first" match.
  * Supports batching and parallelism for large arrays.
+ * For "unordered" strategy, it returns as soon as the first match is found in any batch and attempts to cancel other ongoing batches.
+ * For "ordered" strategy, it processes all batches to guarantee the lowest original index.
  */
 export async function find<T>(
 	items: T[],
@@ -66,7 +67,7 @@ export async function find<T>(
 	}
 
 	const effectiveOptions = getEffectiveOptions(options);
-	const { provider, batching, parallelism, strategy } = effectiveOptions; // Add strategy
+	const { provider, batching, parallelism, strategy } = effectiveOptions;
 
 	if (!provider) {
 		throw new Error(
@@ -77,11 +78,12 @@ export async function find<T>(
 	// If batching is not needed, run find on the whole array
 	if (!batching.maxItemsPerBatch || batching.maxItemsPerBatch >= items.length) {
 		GLOBAL_LOGGER.debug("Running find without batching.");
-		return findSingleBatch(items, predicate, provider);
+		// Pass undefined signal for single batch case
+		return findSingleBatch(items, predicate, provider, undefined);
 	}
 
 	GLOBAL_LOGGER.debug(
-		`Running find with batching: maxItemsPerBatch=${batching.maxItemsPerBatch}, maxConcurrentBatches=${parallelism.maxConcurrentBatches}, delayBetweenStartsMs=${parallelism.delayBetweenStartsMs}, strategy=${strategy}`, // Log strategy
+		`Running find with batching: maxItemsPerBatch=${batching.maxItemsPerBatch}, maxConcurrentBatches=${parallelism.maxConcurrentBatches}, delayBetweenStartsMs=${parallelism.delayBetweenStartsMs}, strategy=${strategy}`,
 	);
 
 	// Prepare items with original indices
@@ -96,106 +98,198 @@ export async function find<T>(
 		batching.maxItemsPerBatch,
 	);
 
-	// Define the function to process a single batch
-	// It should return the *original index* of the first found item in the batch, or -1
-	const processBatch = async (
-		batch: { item: T; originalIndex: number }[],
-		batchIndex: number,
-	): Promise<number> => {
-		// Return number (-1 for not found)
-		GLOBAL_LOGGER.debug(
-			`Processing batch ${batchIndex + 1}/${batches.length} for find operation.`,
+	// --- Strategy-specific execution ---
+
+	if (strategy === "ordered") {
+		// --- Ordered Strategy: Process all batches ---
+		GLOBAL_LOGGER.debug("Using 'ordered' strategy. Processing all batches.");
+
+		// Define the function to process a single batch (returns original index or -1)
+		const processBatchOrdered = async (
+			batch: { item: T; originalIndex: number }[],
+			batchIndex: number,
+		): Promise<number> => {
+			GLOBAL_LOGGER.debug(
+				`Processing batch ${batchIndex + 1}/${batches.length} for find (ordered).`,
+			);
+			try {
+				const batchItems = batch.map(({ item }) => item);
+				const originalIndices = batch.map(({ originalIndex }) => originalIndex);
+				// Pass undefined signal for ordered strategy batches
+				const foundItem = await findSingleBatch(
+					batchItems,
+					predicate,
+					provider,
+					undefined,
+				);
+				if (foundItem !== undefined) {
+					const indexInBatch = batchItems.findIndex(
+						(item) => item === foundItem,
+					);
+					if (indexInBatch !== -1) {
+						const originalIndex = originalIndices[indexInBatch];
+						GLOBAL_LOGGER.debug(
+							`Batch ${batchIndex + 1} (ordered) found match at original index ${originalIndex}.`,
+						);
+						return originalIndex;
+					}
+				}
+				return -1;
+			} catch (error) {
+				GLOBAL_LOGGER.error(
+					`Error processing batch ${batchIndex + 1} (ordered):`,
+					error,
+				);
+				return -1;
+			}
+		};
+
+		const resultsPerBatch = await runBatchesInParallel(
+			batches,
+			processBatchOrdered,
+			parallelism.maxConcurrentBatches,
+			parallelism.delayBetweenStartsMs,
 		);
 
+		const foundIndices = resultsPerBatch.filter(
+			(index): index is number => index !== -1,
+		);
+
+		if (foundIndices.length === 0) {
+			GLOBAL_LOGGER.debug(
+				"No matching item found across all batches (ordered).",
+			);
+			return undefined;
+		}
+
+		const firstMatchingIndex = Math.min(...foundIndices);
+		GLOBAL_LOGGER.debug(
+			`Strategy 'ordered': Found first matching item overall at original index ${firstMatchingIndex}.`,
+		);
+		return items[firstMatchingIndex];
+	}
+
+	// --- Unordered Strategy: Return early and cancel ---
+	GLOBAL_LOGGER.debug(
+		"Using 'unordered' strategy. Processing batches until first match.",
+	);
+	const abortController = new AbortController();
+	let firstMatchIndex = -1; // Shared state to track if found
+
+	// Define the function to process a single batch (returns original index or -1)
+	// Accepts AbortSignal
+	const processBatchUnordered = async (
+		batch: { item: T; originalIndex: number }[],
+		batchIndex: number,
+		signal: AbortSignal,
+	): Promise<number> => {
+		// Check if already aborted or found elsewhere
+		if (signal.aborted || firstMatchIndex !== -1) {
+			GLOBAL_LOGGER.debug(
+				`Skipping batch ${batchIndex + 1} (unordered) as a match was found or aborted.`,
+			);
+			return -1; // Indicate skipped/aborted
+		}
+
+		GLOBAL_LOGGER.debug(
+			`Processing batch ${batchIndex + 1}/${batches.length} for find (unordered).`,
+		);
 		try {
-			// Extract items and their original indices
 			const batchItems = batch.map(({ item }) => item);
 			const originalIndices = batch.map(({ originalIndex }) => originalIndex);
+			// Pass the signal down
+			const foundItem = await findSingleBatch(
+				batchItems,
+				predicate,
+				provider,
+				signal,
+			);
 
-			// Find the first matching item *within this batch*
-			const foundItem = await findSingleBatch(batchItems, predicate, provider);
+			// Check again after await, in case aborted during processing
+			if (signal.aborted) return -1;
 
 			if (foundItem !== undefined) {
-				// Find the index of the found item *within the batch*
-				const indexInBatch = batchItems.findIndex(
-					(item) => item === foundItem, // Simple reference check, might need deep equality for objects
-				);
+				const indexInBatch = batchItems.findIndex((item) => item === foundItem);
 				if (indexInBatch !== -1) {
-					// Map back to the original index
 					const originalIndex = originalIndices[indexInBatch];
+					// Check if we are the *first* to find a match
+					if (firstMatchIndex === -1) {
+						firstMatchIndex = originalIndex; // Set the shared index
+						GLOBAL_LOGGER.debug(
+							`Batch ${batchIndex + 1} (unordered) found FIRST match at original index ${originalIndex}. Aborting others.`,
+						);
+						abortController.abort(); // Signal others to stop
+						return originalIndex;
+					}
+					// Another batch finished first
 					GLOBAL_LOGGER.debug(
-						`Batch ${batchIndex + 1} found matching item at original index ${originalIndex}.`,
+						`Batch ${batchIndex + 1} (unordered) found match at original index ${originalIndex}, but another batch finished earlier.`,
 					);
-					return originalIndex;
+					return -1; // Indicate found, but not the first
 				}
 			}
-
-			GLOBAL_LOGGER.debug(`Batch ${batchIndex + 1} found no matching items.`);
-			return -1; // Return -1 if not found
-		} catch (error) {
-			GLOBAL_LOGGER.error(
-				`Error processing batch ${batchIndex + 1} for find:`,
-				error,
-			);
-			// Treat errors in a batch as if no item was found in that batch
-			return -1; // Return -1 on error
+			return -1; // Not found in this batch
+			// biome-ignore lint/suspicious/noExplicitAny: <explanation>
+		} catch (error: any) {
+			// Handle AbortError specifically if needed, otherwise log general errors
+			if (error.name === "AbortError") {
+				GLOBAL_LOGGER.debug(`Batch ${batchIndex + 1} (unordered) aborted.`);
+			} else {
+				GLOBAL_LOGGER.error(
+					`Error processing batch ${batchIndex + 1} (unordered):`,
+					error,
+				);
+			}
+			return -1; // Treat errors as not found
 		}
 	};
 
-	// Run batches in parallel
-	const resultsPerBatch = await runBatchesInParallel(
+	// Use runBatchesInParallel but pass the signal and handle early exit via abort
+	// Note: runBatchesInParallel itself doesn't inherently stop early based on results,
+	// but the abort signal passed to processBatchUnordered and findSingleBatch
+	// allows individual tasks to terminate sooner if the provider supports it.
+	// The primary mechanism for early exit here is setting firstMatchIndex and aborting.
+	await runBatchesInParallel(
 		batches,
-		processBatch,
+		(batch, batchIndex) =>
+			processBatchUnordered(batch, batchIndex, abortController.signal),
 		parallelism.maxConcurrentBatches,
 		parallelism.delayBetweenStartsMs,
 	);
 
-	// Filter out -1s (not found)
-	const foundIndices = resultsPerBatch.filter(
-		(index): index is number => index !== -1,
-	);
-
-	if (foundIndices.length === 0) {
-		GLOBAL_LOGGER.debug("No matching item found across all batches.");
-		return undefined; // No item found in any batch
+	// After all batches have been scheduled (and potentially aborted/completed)
+	if (firstMatchIndex !== -1) {
+		GLOBAL_LOGGER.debug(
+			`Strategy 'unordered': Found first matching item at original index ${firstMatchIndex}.`,
+		);
+		return items[firstMatchIndex];
 	}
 
-	let firstMatchingIndex: number;
-
-	if (strategy === "ordered") {
-		// Find the minimum original index among all found items
-		firstMatchingIndex = Math.min(...foundIndices);
-		GLOBAL_LOGGER.debug(
-			`Strategy 'ordered': Found first matching item overall at original index ${firstMatchingIndex}.`,
-		);
-	} else {
-		// Strategy 'unordered': Use the first result that wasn't -1
-		// Note: This depends on the order results are returned by runBatchesInParallel,
-		// which corresponds to the order batches *completed*.
-		firstMatchingIndex = foundIndices[0];
-		GLOBAL_LOGGER.debug(
-			`Strategy 'unordered': Found first matching item at original index ${firstMatchingIndex}.`,
-		);
-	}
-
-	return items[firstMatchingIndex];
+	GLOBAL_LOGGER.debug("No matching item found across all batches (unordered).");
+	return undefined;
 }
 
 // Helper to find the first item in a smaller list (a single batch or the full list)
+// Now accepts an optional AbortSignal
 async function findSingleBatch<T>(
 	items: T[],
 	predicate: string,
 	provider: Provider,
+	signal: AbortSignal | undefined, // Added signal parameter
 ): Promise<T | undefined> {
 	if (items.length === 0) {
 		return undefined;
+	}
+	// Check signal before making the call
+	if (signal?.aborted) {
+		throw new Error("Operation aborted"); // Or return undefined, depending on desired behavior
 	}
 
 	const messages: Message[] = [
 		{
 			role: "user",
 			content:
-				"Find the *first* item from the list below that matches the user-provided natural language predicate. Return only the index (integer) of the first matching item, or -1 if none match.", // Updated instruction
+				"Find the *first* item from the list below that matches the user-provided natural language predicate. Return only the index (integer) of the first matching item, or -1 if none match.",
 		},
 		{
 			role: "user",
@@ -209,19 +303,21 @@ ${items.map((item, index) => `  <item index="${index}">${JSON.stringify(item)}</
 		},
 	];
 
-	const response = await provider.execute(messages, {
+	// Pass the signal to the provider execute options
+	const executeOptions: ExecuteOptions = {
 		structuredOutput: structuredOutputSchema,
-	});
+		signal: signal, // Pass the signal here
+	};
+
+	const response = await provider.execute(messages, executeOptions);
 
 	let foundIndex = -1; // Default to -1 (not found)
 
 	if (response.structuredOutput) {
 		const parsedOutput = response.structuredOutput as StructuredOutput;
-		// Ensure index is a number, default to -1 if missing or invalid type
 		foundIndex =
 			typeof parsedOutput.index === "number" ? parsedOutput.index : -1;
 	} else if (response.text) {
-		// Attempt to parse from text as a fallback
 		try {
 			const parsedText = JSON.parse(response.text) as Partial<StructuredOutput>;
 			if (typeof parsedText.index === "number") {
@@ -241,7 +337,6 @@ ${items.map((item, index) => `  <item index="${index}">${JSON.stringify(item)}</
 		}
 	}
 
-	// Check if a valid index within the bounds was found
 	if (foundIndex !== -1 && foundIndex >= 0 && foundIndex < items.length) {
 		return items[foundIndex];
 	}
@@ -286,14 +381,11 @@ function getEffectiveOptions(options?: FindOptions): EffectiveFindOptions {
 		defaults,
 	);
 
-	// Ensure provider is set (specific options > global config)
 	const provider = options?.provider ?? config.provider;
 	if (!provider) {
-		// This case is handled in the main function, but good practice to check
 		GLOBAL_LOGGER.warn("No provider configured globally or passed in options.");
 	}
 
-	// Final effective options, ensuring correct types and defaults
 	const effective: EffectiveFindOptions = {
 		// biome-ignore lint/style/noNonNullAssertion: Provider presence is checked in the main function
 		provider: provider!,
@@ -310,10 +402,9 @@ function getEffectiveOptions(options?: FindOptions): EffectiveFindOptions {
 				mergedOptions.parallelism?.delayBetweenStartsMs ??
 				defaults.parallelism.delayBetweenStartsMs,
 		},
-		strategy: mergedOptions.strategy ?? defaults.strategy, // Explicitly handle strategy default
+		strategy: mergedOptions.strategy ?? defaults.strategy,
 	};
 
-	// Validate merged values
 	if (effective.batching.maxItemsPerBatch <= 0) {
 		throw new Error("maxItemsPerBatch must be greater than 0");
 	}
